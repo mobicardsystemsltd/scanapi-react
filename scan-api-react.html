@@ -1,0 +1,259 @@
+import React, { useState, useEffect, useRef } from 'react';
+import { View, StyleSheet, Alert, Platform, Text } from 'react-native';
+import { WebView } from 'react-native-webview';
+import { request, PERMISSIONS, RESULTS } from 'react-native-permissions';
+
+// HTML wrapper for the scanner
+const htmlWrapper = `
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <style>
+        body { margin:0; padding:0; overflow:hidden; background:#000; }
+        #scanner-container { width:100%; height:100%; }
+    </style>
+</head>
+<body>
+    <div id="scanner-container">
+        <!-- Elements will be added by JavaScript -->
+    </div>
+    
+    <!-- Include jQuery (required for AJAX) -->
+    <script src="https://code.jquery.com/jquery-3.7.1.min.js"></script>
+    
+    <!-- Your scanner JavaScript will be injected here -->
+</body>
+</html>
+`;
+
+const CardScanner = ({ apiConfig, onScanSuccess, onError }) => {
+    const webViewRef = useRef(null);
+    const [hasPermission, setHasPermission] = useState(false);
+    
+    // Request camera permissions
+    useEffect(() => {
+        const requestCameraPermission = async () => {
+            const cameraPermission = Platform.OS === 'ios' 
+                ? PERMISSIONS.IOS.CAMERA 
+                : PERMISSIONS.ANDROID.CAMERA;
+            
+            try {
+                const result = await request(cameraPermission);
+                setHasPermission(result === RESULTS.GRANTED);
+                
+                if (result !== RESULTS.GRANTED) {
+                    Alert.alert(
+                        'Permission Required',
+                        'Camera access is required for card scanning',
+                        [{ text: 'OK' }]
+                    );
+                }
+            } catch (error) {
+                console.error('Permission error:', error);
+                onError?.(error);
+            }
+        };
+        
+        requestCameraPermission();
+    }, []);
+    
+    // JavaScript to inject into WebView
+    const injectedJavaScript = `
+        // Set API configuration from React Native
+        window.mobicard_scan_card_url = '${apiConfig.scanCardUrl}';
+        window.mobicard_transaction_access_token = '${apiConfig.transactionAccessToken}';
+        window.mobicard_token_id = '${apiConfig.tokenId}';
+        
+        // Initialize scanner when page loads
+        document.addEventListener('DOMContentLoaded', function() {
+            if (window.MobicardScanner) {
+                window.MobicardScanner.init();
+                
+                // Listen for scanner events and post to React Native
+                document.addEventListener('mobicard:scanSuccess', function(event) {
+                    window.ReactNativeWebView.postMessage(
+                        JSON.stringify({
+                            type: 'SCAN_SUCCESS',
+                            data: event.detail
+                        })
+                    );
+                });
+                
+                document.addEventListener('mobicard:scanError', function(event) {
+                    window.ReactNativeWebView.postMessage(
+                        JSON.stringify({
+                            type: 'SCAN_ERROR',
+                            data: event.detail
+                        })
+                    );
+                });
+                
+                document.addEventListener('mobicard:sessionExpired', function() {
+                    window.ReactNativeWebView.postMessage(
+                        JSON.stringify({
+                            type: 'SESSION_EXPIRED'
+                        })
+                    );
+                });
+            }
+        });
+        
+        // Add scan frame styling
+        const style = document.createElement('style');
+        style.textContent = \`
+            .camera-container {
+                position: relative;
+                width: 100%;
+                height: 100vh;
+                background: #000;
+                overflow: hidden;
+            }
+            
+            video {
+                width: 100%;
+                height: 100%;
+                object-fit: cover;
+            }
+            
+            .scan-frame {
+                position: absolute;
+                top: 50%;
+                left: 50%;
+                width: 85%;
+                height: 55%;
+                transform: translate(-50%, -50%);
+                border: 2px solid rgba(255,255,255,0.8);
+                border-radius: 12px;
+                box-shadow: 0 0 0 9999px rgba(0,0,0,0.4);
+                pointer-events: none;
+            }
+            
+            .scan-hint {
+                position: absolute;
+                top: 20px;
+                width: 100%;
+                text-align: center;
+                font-size: 14px;
+                color: #0f0;
+                text-shadow: 0 0 10px #0f0;
+                z-index: 20;
+            }
+            
+            .floating-btn {
+                position: absolute;
+                bottom: 20px;
+                left: 50%;
+                transform: translateX(-50%);
+                z-index: 10;
+                background: white;
+                color: black;
+                border: none;
+                padding: 12px 24px;
+                border-radius: 25px;
+                font-weight: bold;
+            }
+        \`;
+        document.head.appendChild(style);
+        
+        // Add required HTML elements
+        const container = document.getElementById('scanner-container');
+        container.innerHTML = \`
+            <div class="camera-container">
+                <video id="camera_preview" autoplay playsinline></video>
+                <div class="scan-hint" id="scan_hint">Align card inside the frame</div>
+                <div class="scan-frame"></div>
+                <div class="scan-loader" id="scan_loader">Scanning...</div>
+                <button class="floating-btn" id="capture_btn">Capture Now</button>
+            </div>
+            <canvas id="capture_canvas" style="display:none;"></canvas>
+        \`;
+        
+        true; // Required for iOS
+    `;
+    
+    // Handle messages from WebView
+    const handleMessage = (event) => {
+        try {
+            const message = JSON.parse(event.nativeEvent.data);
+            
+            switch (message.type) {
+                case 'SCAN_SUCCESS':
+                    onScanSuccess?.(message.data);
+                    break;
+                case 'SCAN_ERROR':
+                    onError?.(new Error(message.data.error || 'Scan failed'));
+                    break;
+                case 'SESSION_EXPIRED':
+                    Alert.alert(
+                        'Session Expired',
+                        'Your session has expired. Please try again.',
+                        [{ text: 'OK' }]
+                    );
+                    break;
+            }
+        } catch (error) {
+            console.error('Error parsing WebView message:', error);
+        }
+    };
+    
+    if (!hasPermission) {
+        return (
+            <View style={styles.container}>
+                <Text>Waiting for camera permission...</Text>
+            </View>
+        );
+    }
+    
+    return (
+        <View style={styles.container}>
+            <WebView
+                ref={webViewRef}
+                source={{{ html: htmlWrapper }}}
+                injectedJavaScript={injectedJavaScript}
+                onMessage={handleMessage}
+                style={styles.webview}
+                javaScriptEnabled={true}
+                domStorageEnabled={true}
+                startInLoadingState={true}
+                mixedContentMode="always"
+                onError={(error) => {
+                    console.error('WebView error:', error);
+                    onError?.(error);
+                }}
+                onHttpError={(error) => {
+                    console.error('WebView HTTP error:', error);
+                    onError?.(error);
+                }}
+            />
+        </View>
+    );
+};
+
+const styles = StyleSheet.create({
+    container: {
+        flex: 1,
+        backgroundColor: '#000',
+    },
+    webview: {
+        flex: 1,
+        backgroundColor: '#000',
+    },
+});
+
+
+export default CardScanner;
+
+// Usage Example:
+// <CardScanner
+//     apiConfig=<?php echo e(//         scanCardUrl: 'https://api.mobicard.com/v1/scan',
+//         transactionAccessToken: 'your_token_here',
+//         tokenId: 'your_token_id'
+//); ?>
+
+//     onScanSuccess={(result) => console.log('Scan result:', result)}
+//     onError={(error) => console.error('Error:', error)}
+// />
+
+
